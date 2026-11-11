@@ -308,6 +308,32 @@ class TestPointSet(TestWithConnector):
             self._assert_bounding_box_equal(obj.bounding_box, 10.0, 10.0, -5.0, -5.0, 20.0, 20.0)
             self.assertEqual(0, len(obj.locations.attributes))
 
+    async def test_concurrent_attribute_edit_preserves_coordinates_and_bounding_box(self):
+        with self._mock_geoscience_objects() as client:
+            obj = await PointSet.create(context=self.context, data=self.example_pointset)
+            original = obj.as_dict()
+            modified = obj._context.data_modified.copy()
+            coordinates_uploaded = asyncio.Event()
+            original_upload = client.upload_dataframe
+
+            async def upload(frame, *args, **kwargs):
+                if list(frame.columns) == ["x", "y", "z"]:
+                    result = await original_upload(frame, *args, **kwargs)
+                    coordinates_uploaded.set()
+                    return result
+                await coordinates_uploaded.wait()
+                obj._document["locations"]["attributes"][0]["external_edit"] = True
+                return await original_upload(frame, *args, **kwargs)
+
+            frame = pd.DataFrame({"x": [10.0], "y": [-5.0], "z": [20.0], "value": [7.0]})
+            with patch.object(client, "upload_dataframe", side_effect=upload):
+                with self.assertRaisesRegex(RuntimeError, "Attributes changed"):
+                    await asyncio.wait_for(obj.locations.from_dataframe(frame), timeout=2)
+
+            original["locations"]["attributes"][0]["external_edit"] = True
+            self.assertEqual(original, obj.as_dict())
+            self.assertEqual(modified, obj._context.data_modified)
+
     async def test_json(self):
         """Test the JSON structure of the created object."""
         with self._mock_geoscience_objects() as mock_client:

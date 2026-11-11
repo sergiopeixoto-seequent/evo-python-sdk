@@ -174,6 +174,17 @@ class ChunkedIOManager:
             for transfer in transfers:
                 if not transfer.done():
                     transfer.cancel()
+            cleanup = asyncio.gather(*transfers, return_exceptions=True)
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Do not close the file or start another attempt while chunks are still using it.
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                raise
 
     async def run(self, source: ISource, destination: IDestination, fb: IFeedback | None = None) -> None:
         """Transfer all data from source to destination.

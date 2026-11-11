@@ -31,10 +31,9 @@ from evo.objects.typed.attributes import (
     UnSupportedDataTypeError,
     _infer_attribute_type_from_series,
 )
-from evo.objects.utils._concurrency import get_upload_semaphore, upload_concurrency
 
 
-class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
+class TestAttributeUploads(IsolatedAsyncioTestCase):
     def setUp(self):
         self.documents = [
             {
@@ -49,16 +48,15 @@ class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
         self.context = ModelContext(obj=Mock(), root_model=None, data_modified={"previous-change"})
         self.attributes = Attributes(self.context, self.documents)
 
-    async def test_attribute_order_and_descriptions_survive_out_of_order_completion(self):
-        second_uploaded = asyncio.Event()
+    async def test_attribute_uploads_are_sequential_and_preserve_order_and_descriptions(self):
+        uploaded = []
         frame = pd.DataFrame({"first": [1.0], "second": [2.0]})
         frame.attrs["attribute_descriptions"] = {"first": AttributeDescription(unit="m")}
 
         async def upload(document, *_args, **_kwargs):
-            if document["name"] == "first":
-                await second_uploaded.wait()
-            else:
-                second_uploaded.set()
+            self.assertEqual(["first", "second"][len(uploaded)], document["name"])
+            await asyncio.sleep(0)
+            uploaded.append(document["name"])
             document["values"] = {"data": document["name"], "length": 1}
 
         with (
@@ -68,37 +66,28 @@ class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(Attributes._data_to_schema(frame, Mock()), timeout=2)
 
         self.assertEqual(["first", "second"], [document["name"] for document in result])
+        self.assertEqual(["first", "second"], uploaded)
         self.assertEqual("m", result[0]["attribute_description"]["unit"])
         self.assertNotIn("attribute_description", result[1])
 
-    async def test_failure_cancels_and_waits_for_other_columns(self):
-        started = asyncio.Event()
-        release = asyncio.Event()
-        cleaned_up = asyncio.Event()
+    async def test_failure_does_not_start_later_columns(self):
+        uploaded = []
 
         async def upload(document, *_args, **_kwargs):
-            if document["name"] == "slow":
-                started.set()
-                try:
-                    await release.wait()
-                finally:
-                    await asyncio.sleep(0)
-                    cleaned_up.set()
-            else:
-                await started.wait()
+            uploaded.append(document["name"])
+            if document["name"] == "failed":
                 raise RuntimeError("attribute upload failed")
+            document["values"] = {"data": "saved", "length": 1}
 
         with (
             patch("evo.objects.typed.attributes.get_data_client"),
             patch.object(Attribute, "_upload_attribute_values", side_effect=upload),
         ):
-            try:
-                with self.assertRaisesRegex(RuntimeError, "attribute upload failed"):
-                    await Attributes._data_to_schema(pd.DataFrame({"slow": [1.0], "failed": [2.0]}), Mock())
-                self.assertTrue(cleaned_up.is_set(), "A failed upload left another column running")
-            finally:
-                release.set()
-                await asyncio.wait_for(cleaned_up.wait(), timeout=2)
+            with self.assertRaisesRegex(RuntimeError, "attribute upload failed"):
+                await Attributes._data_to_schema(
+                    pd.DataFrame({"first": [1.0], "failed": [2.0], "unstarted": [3.0]}), Mock()
+                )
+        self.assertEqual(["first", "failed"], uploaded)
 
     @parameterized.expand([("append_attribute",), ("append_attributes",), ("set_attributes",)])
     async def test_mutations_forward_aggregated_feedback(self, method):
@@ -152,20 +141,16 @@ class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
         self.assertEqual({"previous-change"}, self.context.data_modified)
 
     @parameterized.expand([("append_attributes",), ("set_attributes",)])
-    async def test_mutations_overlap_and_preserve_column_order(self, method):
-        first_finished = asyncio.Event()
-        second_started = asyncio.Event()
+    async def test_mutations_upload_columns_sequentially_and_preserve_order(self, method):
+        uploaded = []
         existing_attribute = self.attributes["first"]
         frame = pd.DataFrame({"second": [3.0], "first": [2.0]})
         frame.attrs["attribute_descriptions"] = {"second": AttributeDescription(unit="s")}
 
         async def upload(document, *_args, **_kwargs):
-            if document["name"] == "second":
-                second_started.set()
-                await first_finished.wait()
-            else:
-                await second_started.wait()
-                first_finished.set()
+            self.assertEqual(["second", "first"][len(uploaded)], document["name"])
+            await asyncio.sleep(0)
+            uploaded.append(document["name"])
             document["values"] = {"data": f"new-{document['name']}", "length": 1}
 
         with (
@@ -175,6 +160,7 @@ class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
             await asyncio.wait_for(getattr(self.attributes, method)(frame), timeout=2)
 
         self.assertEqual(["second", "first"], [document["name"] for document in self.documents[-2:]])
+        self.assertEqual(["second", "first"], uploaded)
         self.assertEqual("s", self.documents[-2]["attribute_description"]["unit"])
         self.assertTrue({"new-first", "new-second"} <= self.context.data_modified)
         if method == "set_attributes":
@@ -249,28 +235,28 @@ class TestConcurrentAttributeUploads(IsolatedAsyncioTestCase):
         upload.assert_not_awaited()
         self.assertEqual("old-first", self.documents[0]["values"]["data"])
 
-    async def test_type_inference_runs_in_worker_with_upload_slot_held(self):
-        started = threading.Event()
+    async def test_type_inference_runs_in_worker_without_blocking_the_event_loop(self):
+        started = asyncio.Event()
         release = threading.Event()
         worker_threads = []
+        loop = asyncio.get_running_loop()
         infer = _infer_attribute_type_from_series
 
         def blocking_infer(series):
             worker_threads.append(threading.get_ident())
-            started.set()
-            release.wait()
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(timeout=10):
+                raise TimeoutError("Test did not release type inference")
             return infer(series)
 
         with (
-            upload_concurrency(1),
             patch("evo.objects.typed.attributes._infer_attribute_type_from_series", side_effect=blocking_infer),
             patch("evo.objects.typed.attributes.get_data_client"),
             patch.object(Attribute, "_upload_attribute_values", new_callable=AsyncMock),
         ):
             task = asyncio.create_task(Attributes._data_to_schema(pd.DataFrame({"new": [2.0]}), Mock()))
             try:
-                await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
-                self.assertEqual(0, get_upload_semaphore()._value)
+                await asyncio.wait_for(started.wait(), timeout=2)
                 self.assertNotEqual(threading.get_ident(), worker_threads[0])
             finally:
                 release.set()

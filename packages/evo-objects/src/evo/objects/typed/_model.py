@@ -186,6 +186,11 @@ class SchemaBuilder:
         schema_property = self._properties[name]
         _set_property_value(schema_property, self.document, value)
 
+    async def set_sub_model_value(self, name: str, data: Any) -> None:
+        metadata = self._sub_models[name]
+        sub_document = await metadata.model_type._data_to_schema(data, context=self._context)
+        self._assign_sub_document(name, sub_document)
+
     async def build_from_data(self, data: Any, skip_sub_models: set[str] | None = None) -> dict[str, Any]:
         """Build the schema document by applying all properties and sub-models."""
         for key, prop in self._properties.items():
@@ -195,7 +200,6 @@ class SchemaBuilder:
                 value = getattr(data, key, None)
                 self.set_property(key, value)
 
-        pending: list[tuple[str, Any]] = []
         for name, metadata in self._sub_models.items():
             if skip_sub_models and name in skip_sub_models:
                 continue
@@ -203,16 +207,12 @@ class SchemaBuilder:
                 sub_data = getattr(data, metadata.data_field, None)
             else:
                 sub_data = data
-            pending.append((name, sub_data))
-        await self.set_sub_model_values(pending)
+            await self.set_sub_model_value(name, sub_data)
 
         return self.document
 
     async def set_sub_model_values(self, values: Sequence[tuple[str, Any]]) -> None:
-        """Convert several sub-models concurrently, then assign the results in the given order.
-
-        Sub-models are independent, so their data uploads can run in parallel.
-        """
+        """Convert an explicit group of independent sub-models, then assign results in input order."""
         sub_documents = await gather_cancelling(
             *(self._sub_models[name].model_type._data_to_schema(data, context=self._context) for name, data in values)
         )
@@ -510,4 +510,4 @@ class SchemaList(Sequence[_M]):
             return []
         if not isinstance(data, Sequence):
             raise TypeError(f"Expected a sequence for SchemaList data, got {type(data).__name__}")
-        return await gather_cancelling(*(cls._item_type._data_to_schema(item, context) for item in data))
+        return [await cls._item_type._data_to_schema(item, context) for item in data]

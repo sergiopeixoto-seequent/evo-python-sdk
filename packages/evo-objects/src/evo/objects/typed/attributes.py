@@ -24,7 +24,7 @@ from evo import jmespath
 from evo.common import IContext, IFeedback
 from evo.common.utils import NoFeedback, iter_with_fb, split_feedback
 from evo.objects import DownloadedObject
-from evo.objects.utils._concurrency import gather_cancelling, run_upload_preparation
+from evo.objects.utils._concurrency import run_upload_preparation
 from evo.objects.utils.table_formats import (
     BOOL_ARRAY_1,
     DATE_TIME_ARRAY,
@@ -214,11 +214,12 @@ class Attribute(SchemaModel):
             attr_doc.update(await data_client.upload_category_dataframe(df, fb=fb))
         else:
             table_formats = _attribute_table_formats.get(attribute_type)
+            if attribute_type == "date_time":
+                df = await run_upload_preparation(_prepare_datetime_dataframe, df)
             attr_doc["values"] = await data_client.upload_dataframe(
                 df,
                 table_format=table_formats,
                 fb=fb,
-                _prepare_dataframe=_prepare_datetime_dataframe if attribute_type == "date_time" else None,
             )
 
         if attribute_type in ["scalar", "integer", "category", "date_time"]:
@@ -357,14 +358,16 @@ class Attributes(SchemaList[Attribute]):
                 if not isinstance(description, AttributeDescription):
                     raise TypeError("attribute description must be a AttributeDescription.")
                 validated_descriptions[col] = description.to_schema()
-        new_columns = [col for col in df.columns if str(col) not in existing]
-        inferred = await gather_cancelling(
-            *(run_upload_preparation(_infer_attribute_type_from_series, df[col]) for col in new_columns)
-        )
-        new_types = dict(zip(new_columns, inferred))
-        attribute_types = {
-            col: existing[str(col)].attribute_type if str(col) in existing else new_types[col] for col in df.columns
-        }
+
+        def infer_types() -> dict[Any, str]:
+            return {
+                col: existing[str(col)].attribute_type
+                if str(col) in existing
+                else _infer_attribute_type_from_series(df[col])
+                for col in df.columns
+            }
+
+        attribute_types = await run_upload_preparation(infer_types) if len(df.columns) else {}
         return validated_descriptions, attribute_types
 
     @staticmethod
@@ -388,14 +391,12 @@ class Attributes(SchemaList[Attribute]):
         data_client = get_data_client(context)
         column_fbs = split_feedback(fb, [1.0] * len(df.columns))
 
-        return await gather_cancelling(
-            *(
-                _build_new_attribute_document(
-                    col, df[col], attribute_types[col], descriptions.get(col), data_client, col_fb
-                )
-                for col, col_fb in zip(df.columns, column_fbs)
+        return [
+            await _build_new_attribute_document(
+                col, df[col], attribute_types[col], descriptions.get(col), data_client, col_fb
             )
-        )
+            for col, col_fb in zip(df.columns, column_fbs)
+        ]
 
     async def to_dataframe(self, *keys: str, fb: IFeedback = NoFeedback) -> pd.DataFrame:
         """Load a DataFrame containing the values from the specified attributes in the object.
@@ -490,19 +491,20 @@ class Attributes(SchemaList[Attribute]):
             )
             return None, document
 
-        documents = await gather_cancelling(
-            *(upload_column(col, col_fb) for col, col_fb in zip(df.columns, column_fbs))
-        )
+        documents = [await upload_column(col, col_fb) for col, col_fb in zip(df.columns, column_fbs)]
         return _PreparedAttributes(documents, originals, original_snapshot)
 
-    def _apply(self, prepared: _PreparedAttributes) -> None:
-        """Replace live attributes after uploads, preserving wrappers and rejecting concurrent edits."""
+    def _check_unchanged(self, prepared: _PreparedAttributes) -> None:
         if (
             len(self._document) != len(prepared.original_documents)
             or any(current is not original for current, original in zip(self._document, prepared.original_documents))
             or tuple(self._document) != prepared.original_snapshot
         ):
             raise RuntimeError("Attributes changed while replacement values were uploading")
+
+    def _apply(self, prepared: _PreparedAttributes) -> None:
+        """Replace live attributes after uploads, preserving wrappers and rejecting concurrent edits."""
+        self._check_unchanged(prepared)
         documents = []
         for original, document in prepared.documents:
             if original is not None:

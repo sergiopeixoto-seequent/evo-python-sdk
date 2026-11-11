@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import unittest
@@ -160,6 +161,51 @@ class TestChunkedIOManager(unittest.IsolatedAsyncioTestCase):
         self.manager = ChunkedIOManager(
             retry=Retry(logger, backoff_method=BackoffLinear(0)), chunk_size=self.CHUNK_SIZE, max_workers=1
         )
+
+    @parameterized.expand([("failure", False), ("cancellation", True)])
+    async def test_transfer_drains_chunks_before_leaving_source(self, _name, cancel):
+        started = asyncio.Event()
+        cleaning = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        source = _TestIO(content=self.DATA)
+        destination = _TestIO()
+        failure = ValueError("chunk failed")
+        manager = ChunkedIOManager(chunk_size=self.CHUNK_SIZE, max_workers=2)
+
+        async def write(offset, data):
+            if offset != 0:
+                await started.wait()
+                if not cancel:
+                    raise failure
+                await asyncio.Event().wait()
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+                finished.set()
+
+        with mock.patch.object(destination, "write_chunk", side_effect=write):
+            task = asyncio.create_task(manager.run(source, destination))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                if cancel:
+                    task.cancel()
+                await asyncio.wait_for(cleaning.wait(), timeout=2)
+                if cancel:
+                    task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError if cancel else ValueError):
+                    await task
+                self.assertTrue(finished.is_set())
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def test_run_til_complete(self) -> None:
         # Create and verify source.

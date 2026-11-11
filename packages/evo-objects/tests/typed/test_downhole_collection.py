@@ -45,7 +45,6 @@ from evo.objects.typed.downhole_collection import (
     IntervalCollection,
 )
 from evo.objects.typed.exceptions import ObjectValidationError
-from evo.objects.utils import upload_concurrency
 from evo.objects.utils.data import _iter_refs
 
 from .helpers import MockClient
@@ -232,7 +231,7 @@ class TestDownholeCollection(TestWithConnector):
             result = await DownholeCollection.create(context=self.context, data=data)
         self.assertIsInstance(result, DownholeCollection)
 
-    async def test_collection_uploads_run_concurrently_and_preserve_order(self):
+    async def test_collection_uploads_run_sequentially_and_preserve_order(self):
         template = _make_example_data().collections[0]
         interval = IntervalCollection(
             name="intervals",
@@ -246,34 +245,25 @@ class TestDownholeCollection(TestWithConnector):
             dataclasses.replace(template, name="last"),
         ]
         data = _make_example_data(collections=collections)
-        started = set()
-        all_started = asyncio.Event()
-        release = asyncio.Event()
+        completed = []
         build_from_data = SchemaBuilder.build_from_data
 
         async def build(builder, payload, skip_sub_models=None):
             if isinstance(payload, (DistanceCollection, IntervalCollection)):
-                started.add(payload.name)
-                if len(started) == len(collections):
-                    all_started.set()
-                await release.wait()
+                self.assertEqual(collections[len(completed)].name, payload.name)
+                schema = await build_from_data(builder, payload, skip_sub_models=skip_sub_models)
+                completed.append(payload.name)
+                return schema
             return await build_from_data(builder, payload, skip_sub_models=skip_sub_models)
 
         with (
             self._mock_geoscience_objects(),
             patch.object(SchemaBuilder, "build_from_data", new=build),
         ):
-            creation = asyncio.create_task(DownholeCollection.create(context=self.context, data=data))
-            try:
-                await asyncio.wait_for(all_started.wait(), timeout=2)
-                release.set()
-                result = await asyncio.wait_for(creation, timeout=2)
-            finally:
-                release.set()
-                creation.cancel()
-                await asyncio.gather(creation, return_exceptions=True)
+            result = await DownholeCollection.create(context=self.context, data=data)
 
         self.assertEqual(["first", "intervals", "last"], result.collections.names())
+        self.assertEqual(["first", "intervals", "last"], completed)
         self.assertEqual("m", result.collections.get("intervals").from_to.unit)
         npt.assert_array_equal(interval.table, await result.collections.get("intervals").to_dataframe())
         self.assertEqual(
@@ -281,9 +271,7 @@ class TestDownholeCollection(TestWithConnector):
             list((await result.collections.get("last").to_dataframe()).columns),
         )
 
-    @parameterized.expand([("default", None), ("serial", 1), ("lower", 3), ("higher", 12)])
-    async def test_nested_table_uploads_share_a_concurrency_limit(self, _name, configured_limit):
-        limit = configured_limit if configured_limit is not None else 8
+    async def test_wide_nested_tables_do_not_multiply_active_file_uploads(self):
         template = _make_example_data().collections[0]
         holes = template.holes.astype({"hole_index": "int32", "offset": "uint64", "count": "uint64"})
         table = template.table.assign(**{f"reading_{i}": np.arange(4, dtype=float) for i in range(16)})
@@ -318,10 +306,7 @@ class TestDownholeCollection(TestWithConnector):
             context = StaticContext.from_environment(
                 environment=self.environment, connector=self.connector, cache=cache
             )
-            with (
-                patch.object(ObjectDataUpload, "upload_from_cache", upload),
-                upload_concurrency(configured_limit) if configured_limit is not None else contextlib.nullcontext(),
-            ):
+            with patch.object(ObjectDataUpload, "upload_from_cache", upload):
                 document = await DownholeCollection._data_to_schema(data, context)
             cache_location = cache.get_location(environment=self.environment, scope="geoscience-object")
             for collection in document["collections"]:
@@ -337,11 +322,8 @@ class TestDownholeCollection(TestWithConnector):
                 self.assertEqual(category["values"]["length"], len(table))
                 self.assertEqual(distance["values"]["length"], len(table))
 
-        if limit > 1:
-            self.assertGreater(peak, 1)
-        else:
-            self.assertEqual(1, peak)
-        self.assertLessEqual(peak, limit)
+        self.assertGreater(peak, 1)
+        self.assertLessEqual(peak, 3)  # One table plus a category's values and lookup.
         self.assertEqual(0, active)
         references = list(_iter_refs(document))
         self.assertGreater(len(references), 50)

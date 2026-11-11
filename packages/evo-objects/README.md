@@ -107,29 +107,37 @@ distance or `from` column is ignored.
 
 ### Upload concurrency
 
-Typed objects upload independent tables and attributes concurrently, preserving input order and applying mutations only
-after all required uploads succeed. Configure the upload limit for a block, including its child tasks:
+Async uploads perform DataFrame/Arrow conversion and Parquet saving in the event loop's default thread pool.
+Independent pairs, such as category values/lookup files and a typed table/its attributes, run concurrently.
+Attribute columns, schema lists, and downhole collections are processed sequentially to avoid unrestricted file
+fan-out. Results preserve input order, and table/attribute replacement is applied only after the required uploads
+and conflict checks succeed. A cancelled operation waits for active preparation workers to finish.
 
-```python
-from evo.objects.utils import upload_concurrency
+There is no SDK-wide upload semaphore or custom thread pool. HTTP connections are limited by
+`AioTransport(num_pools=...)` (default: 4; 0 disables the connection limit), separately from the thread pool.
+Connection limits do not bound queued tasks or buffered file data; applications scheduling many direct uploads
+concurrently should control their own file-level fan-out. Do not modify input DataFrames or clear their cache while
+uploads are running.
 
-with upload_concurrency(max_concurrent=8):
-    dhc = await DownholeCollection.create(context, data)
-```
+Table, DataFrame, and category uploads retry transient HTTP failures (408, 429, 500, 502, 503, 504), raw connection
+failures, and timeouts. The default is three total attempts with exponential backoff (4 then 8 seconds). Each retry
+reuses the completed cached Parquet file and restarts that file's upload, not the whole collection; this also covers
+upload-URL acquisition, failed chunks, and block-list commits. Progress does not move backwards across attempts.
+Permanent failures, cancellation, and already-exhausted transport connection retries are not retried.
+After exhaustion the last error is raised with the retry history chained as its cause, so persistent failures
+still fail the operation rather than silently skipping data.
 
-The default limit is **4** and is shared by uploads on the same event loop, including direct `ObjectDataClient` calls.
-Unlike uploads, `download_tables(max_concurrency=...)` applies a separate limit to each call. The upload limit covers
-preparation and transfers; a storage retry may hold a slot. Nested scopes restore the previous setting.
-HTTP connection limits are configured separately with `AioTransport(num_pools=...)`.
+Pass `retry=Retry(logger=..., max_attempts=..., backoff_method=...)` to any of these upload methods to override the
+policy. A category's values and lookup each have their own attempt budget. To avoid multiplying retry budgets, the
+storage layer runs once per table attempt; transport-level connection retries remain separate and unchanged.
 
-Uploads retry transient failures up to three times by default; pass `retry=Retry(...)` to an `ObjectDataClient` upload
-method to customize that policy. On exhaustion, the last failure is raised and the retry history is chained as its
-cause. Storage transfers make one attempt per outer retry, preventing retry layers from multiplying requests.
-For custom interception, override `upload_dataframe` or `upload_category_dataframe` for DataFrame inputs; these methods
-do not dispatch through the table upload methods.
+DataFrame uploads continue to dispatch through `upload_table` or `upload_category_table`, so those overrides still
+intercept uploads. Typed table replacement stages data through `_upload` and commits through `_apply_uploaded_table`;
+subclasses customizing `DataTable.from_dataframe` must move commit-time derived-metadata updates to
+`_apply_uploaded_table` for them to run when the table is updated together with attributes. That hook must perform
+fallible validation before changing live state.
 
-To configure a separate HTTP connection limit, pass a configured transport to your context using your existing
-authorizer, cache, and environment:
+To configure HTTP connections, pass a transport to your context using your existing authorizer, cache, and environment:
 
 ```python
 from evo.aio import AioTransport

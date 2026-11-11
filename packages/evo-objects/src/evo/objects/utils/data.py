@@ -10,11 +10,10 @@
 #  limitations under the License.
 
 import asyncio
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, Iterable, cast
 from uuid import UUID
-from weakref import WeakKeyDictionary
 
 import numpy as np
 
@@ -26,7 +25,7 @@ from evo.common.utils import NoFeedback, PartialFeedback, Retry, split_feedback
 
 from ..exceptions import TableFormatError
 from ..io import _CACHE_SCOPE, ObjectDataDownload, ObjectDataUpload
-from ._concurrency import _DEFAULT_MAX_CONCURRENCY, gather_cancelling, get_upload_semaphore, run_upload_preparation
+from ._concurrency import gather_cancelling, run_upload_preparation
 from .table_formats import INTEGER_ARRAY_1_INT32, INTEGER_ARRAY_MD_INT32, LOOKUP_TABLE_INT32
 from .tables import KnownTableFormat
 from .types import ArrayTableInfo, CategoryInfo, LookupTableInfo
@@ -49,12 +48,13 @@ __all__ = ["ObjectDataClient"]
 logger = logging.getLogger("object.data")
 
 _DATA_ID_KEY = "data"  # The key used to identify data references in geoscience objects.
+_DEFAULT_MAX_CONCURRENCY = 4
 _TRANSIENT_UPLOAD_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def _is_transient_upload_error(error: Exception) -> bool:
     if isinstance(error, TransportError):
-        # Connection failures have already exhausted the transport's retry policy.
+        # The transport has already exhausted its own connection retry policy.
         return False
     if isinstance(error, RetryError):
         return bool(error.exceptions) and all(_is_transient_upload_error(exc) for exc in error.exceptions)
@@ -66,7 +66,7 @@ def _is_transient_upload_error(error: Exception) -> bool:
 
 
 class _MonotonicFeedback(IFeedback):
-    """Prevent nested storage retries from reporting progress below an earlier attempt."""
+    """Keep progress from moving backwards when a cached file is retried."""
 
     def __init__(self, feedback: IFeedback) -> None:
         self._feedback = feedback
@@ -119,6 +119,10 @@ def _get_schema_from_dataframe(dataframe: "pd.DataFrame") -> pa.Schema:
     return pa.schema(fields)
 
 
+def _dataframe_to_table(dataframe: "pd.DataFrame") -> pa.Table:
+    return pa.Table.from_pandas(dataframe, _get_schema_from_dataframe(dataframe))
+
+
 class ObjectDataClient:
     """An optional wrapper around data upload and download functionality for geoscience objects.
 
@@ -136,9 +140,6 @@ class ObjectDataClient:
         self._environment = environment
         self._connector = connector
         self._cache = cache
-        self._inflight_uploads: WeakKeyDictionary[
-            asyncio.AbstractEventLoop, dict[tuple[str, int | None], asyncio.Task[None]]
-        ] = WeakKeyDictionary()
 
     @property
     def cache_location(self) -> Path:
@@ -236,10 +237,11 @@ class ObjectDataClient:
             If a single KnownTableFormat is provided, that format will be used.
             Otherwise, the format will be inferred from the table, either by checking against the provided formats or by
             checking against all known formats.
-        :param retry: Retry policy for transient HTTP statuses (408, 429, 500, 502, 503, 504), raw connection/timeouts,
-            and exhausted storage retries containing only such failures. Defaults to three attempts with exponential
-            backoff, reusing cached data. On exhaustion, the last failure is raised with the retry history chained as
-            its cause. TransportError is not retried again. Storage transfer attempts are bounded by this retry policy.
+        :param retry: Policy for transient HTTP statuses (408, 429, 500, 502, 503, 504) and raw connection/timeouts,
+            including wrapped storage failures. Defaults to three total attempts with exponential backoff, reusing
+            the cached file. Exhaustion raises the last error with RetryError history chained as its cause.
+            Exhausted transport connection retries are not repeated. Storage transfers use one attempt per
+            table attempt to avoid multiplying retry budgets.
 
         :return: A description of the uploaded data.
 
@@ -251,61 +253,35 @@ class ObjectDataClient:
         return table_info
 
     async def _upload_cached_table(self, name: str, fb: IFeedback, retry: Retry | None) -> None:
-        loop = asyncio.get_running_loop()
-        uploads = self._inflight_uploads.setdefault(loop, {})
-        key = (name, id(retry) if retry is not None else None)
-        task = uploads.get(key)
-        is_owner = task is None
-        if task is None:
-            task = asyncio.create_task(self._upload_cached_table_once(name, fb, retry))
-            uploads[key] = task
-
-            def remove_finished_upload(finished: asyncio.Task[None]) -> None:
-                if uploads.get(key) is finished:
-                    uploads.pop(key, None)
-                if not finished.cancelled():
-                    finished.exception()
-
-            task.add_done_callback(remove_finished_upload)
-        if is_owner:
-            await task
-        else:
-            await asyncio.shield(task)
-        fb.progress(1)
-
-    async def _upload_cached_table_once(self, name: str, fb: IFeedback, retry: Retry | None) -> None:
-        if retry is None:
-            retry = Retry(logger=logger)
-        semaphore = get_upload_semaphore()
+        retry = Retry(logger=logger) if retry is None else retry
         upload = ObjectDataUpload(connector=self._connector, environment=self._environment, name=name)
         upload_fb = _MonotonicFeedback(fb) if fb is not NoFeedback else NoFeedback
         with error_context(f"While uploading table data '{name}'", logger=logger):
             async for attempt in retry:
                 try:
-                    async with semaphore:
-                        try:
-                            await upload.upload_from_cache(
-                                cache=self._cache,
-                                transport=self._connector.transport,
-                                retry=Retry(logger=logger, max_attempts=1),
-                                fb=upload_fb,
-                            )
-                        except RetryError as storage_error:
-                            if len(storage_error.exceptions) == 1 and isinstance(
-                                storage_error.exceptions[0], ChunkedIOError
-                            ):
-                                raise storage_error.exceptions[0]
-                            raise
+                    try:
+                        await upload.upload_from_cache(
+                            cache=self._cache,
+                            transport=self._connector.transport,
+                            retry=Retry(logger=logger, max_attempts=1),
+                            fb=upload_fb,
+                        )
+                    except RetryError as storage_error:
+                        if len(storage_error.exceptions) == 1 and isinstance(
+                            storage_error.exceptions[0], ChunkedIOError
+                        ):
+                            raise storage_error.exceptions[0]
+                        raise
                 except DataExistsError:
                     logger.debug(f"Data not uploaded because data already exists (label: {name})")
                     fb.progress(1)
-                except Exception as exc:
-                    if not _is_transient_upload_error(exc):
+                except Exception as error:
+                    if not _is_transient_upload_error(error):
                         raise
                     try:
-                        attempt.set_exception(exc)
-                    except RetryError as retry_error:
-                        raise exc from retry_error
+                        attempt.set_exception(error)
+                    except RetryError as history:
+                        raise error from history
 
     async def upload_category_table(
         self, table: pa.Table, fb: IFeedback = NoFeedback, retry: Retry | None = None
@@ -318,7 +294,7 @@ class ObjectDataClient:
 
         :param table: The table to be uploaded.
         :param fb: A feedback object for tracking upload progress.
-        :param retry: Retry policy for each uploaded table, as described by upload_table.
+        :param retry: Retry policy for each uploaded file, as described by upload_table.
 
         :return: A description of the uploaded data.
 
@@ -326,11 +302,21 @@ class ObjectDataClient:
             what int32 type can represent.
         """
 
-        category_info, sizes = await run_upload_preparation(self._save_category_table, table)
-        return await self._upload_category_info(category_info, sizes, fb, retry)
+        values, lookup = await run_upload_preparation(self._build_category_tables, table)
+        values_fb, lookup_fb = split_feedback(
+            fb, [values.num_rows * values.num_columns, lookup.num_rows * lookup.num_columns]
+        )
+        value_table_format = INTEGER_ARRAY_1_INT32 if values.num_columns == 1 else INTEGER_ARRAY_MD_INT32
+        retry_kwargs = {"retry": retry} if retry is not None else {}
+        value_info, lookup_info = await gather_cancelling(
+            self.upload_table(values, fb=values_fb, table_format=value_table_format, **retry_kwargs),
+            self.upload_table(lookup, fb=lookup_fb, table_format=LOOKUP_TABLE_INT32, **retry_kwargs),
+        )
+        return CategoryInfo(values=cast(ArrayTableInfo, value_info), table=cast(LookupTableInfo, lookup_info))
 
-    def _save_category_table(self, table: pa.Table) -> tuple[CategoryInfo, tuple[int, int]]:
-        """Build and cache both category tables without retaining Arrow copies during upload."""
+    @staticmethod
+    def _build_category_tables(table: pa.Table) -> tuple[pa.Table, pa.Table]:
+        """Build category values and lookup tables in a worker thread."""
         all_chunks = []
         columns_chunk_range = []
         for column in table.itercolumns():
@@ -367,25 +353,7 @@ class ObjectDataClient:
             [np.arange(len(dictionary_values), dtype=np.int32), dictionary_values], names=["key", "value"]
         )
 
-        v_size = values.num_rows * values.num_columns
-        t_size = lookup.num_rows * lookup.num_columns
-        value_table_format = INTEGER_ARRAY_1_INT32 if values.num_columns == 1 else INTEGER_ARRAY_MD_INT32
-        value_table = self.save_table(values, value_table_format)
-        lookup_table = self.save_table(lookup, LOOKUP_TABLE_INT32)
-        return (
-            CategoryInfo(values=cast(ArrayTableInfo, value_table), table=cast(LookupTableInfo, lookup_table)),
-            (v_size, t_size),
-        )
-
-    async def _upload_category_info(
-        self, category_info: CategoryInfo, sizes: tuple[int, int], fb: IFeedback, retry: Retry | None
-    ) -> CategoryInfo:
-        values_fb, lookup_fb = split_feedback(fb, sizes)
-        await gather_cancelling(
-            self._upload_cached_table(category_info["values"]["data"], values_fb, retry),
-            self._upload_cached_table(category_info["table"]["data"], lookup_fb, retry),
-        )
-        return category_info
+        return values, lookup
 
     async def download_table(
         self, object_id: UUID, version_id: str, table_info: dict, fb: IFeedback = NoFeedback
@@ -526,8 +494,7 @@ class ObjectDataClient:
                 no table formats are specified, raised when the table does not match any known format.
             :raises StorageFileNotFoundError: If the destination does not exist or is not a directory.
             """
-            schema = _get_schema_from_dataframe(dataframe)
-            table = pa.Table.from_pandas(dataframe, schema)
+            table = _dataframe_to_table(dataframe)
             return self.save_table(table, table_format=table_format)
 
         async def upload_dataframe(
@@ -536,7 +503,6 @@ class ObjectDataClient:
             fb: IFeedback = NoFeedback,
             table_format: KnownTableFormat | Iterable[KnownTableFormat] | None = None,
             retry: Retry | None = None,
-            _prepare_dataframe: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
         ) -> dict:
             """Upload pandas dataframe to the geoscience object service, returning a GO model of the uploaded data.
 
@@ -546,8 +512,7 @@ class ObjectDataClient:
                 If a single KnownTableFormat is provided, that format will be used.
                 Otherwise, the format will be inferred from the table, either by checking against the provided formats or by
                 checking against all known formats.
-            :param retry: Retry policy for the uploaded table, as described by upload_table.
-                Override this method, not upload_table, to intercept DataFrame uploads.
+            :param retry: Retry policy for the uploaded file, as described by upload_table.
 
             :return: A description of the uploaded data.
 
@@ -555,13 +520,9 @@ class ObjectDataClient:
                 no table formats are specified, raised when the table does not match any known format.
             """
 
-            def save() -> dict:
-                prepared = _prepare_dataframe(dataframe) if _prepare_dataframe is not None else dataframe
-                return self.save_dataframe(prepared, table_format)
-
-            table_info = await run_upload_preparation(save)
-            await self._upload_cached_table(table_info["data"], fb, retry)
-            return table_info
+            table = await run_upload_preparation(_dataframe_to_table, dataframe)
+            retry_kwargs = {"retry": retry} if retry is not None else {}
+            return await self.upload_table(table, fb=fb, table_format=table_format, **retry_kwargs)
 
         async def upload_category_dataframe(
             self, dataframe: pd.DataFrame, fb: IFeedback = NoFeedback, retry: Retry | None = None
@@ -576,8 +537,7 @@ class ObjectDataClient:
 
             :param dataframe: The pandas dataframe to be uploaded.
             :param fb: A feedback object for tracking upload progress.
-            :param retry: Retry policy for each uploaded table, as described by upload_table.
-                Override this method, not upload_category_table, to intercept category DataFrame uploads.
+            :param retry: Retry policy for each uploaded file, as described by upload_table.
 
             :return: A description of the uploaded data.
 
@@ -585,12 +545,9 @@ class ObjectDataClient:
                 what int32 type can represent.
             """
 
-            def save() -> tuple[CategoryInfo, tuple[int, int]]:
-                schema = _get_schema_from_dataframe(dataframe)
-                return self._save_category_table(pa.Table.from_pandas(dataframe, schema))
-
-            category_info, sizes = await run_upload_preparation(save)
-            return await self._upload_category_info(category_info, sizes, fb, retry)
+            table = await run_upload_preparation(_dataframe_to_table, dataframe)
+            retry_kwargs = {"retry": retry} if retry is not None else {}
+            return await self.upload_category_table(table, fb=fb, **retry_kwargs)
 
         async def download_dataframe(
             self, object_id: UUID, version_id: str, table_info: dict, fb: IFeedback = NoFeedback

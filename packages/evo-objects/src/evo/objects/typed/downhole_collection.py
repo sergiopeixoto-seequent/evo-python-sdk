@@ -488,8 +488,7 @@ class DownholeCollectionTables(_DownholeCollectionChild, SchemaList[DownholeDist
                     schema["distance"]["unit"] = collection.unit
             return schema
 
-        # Collections are independent, so upload them concurrently while preserving input order.
-        return await gather_cancelling(*(convert(collection) for collection in data))
+        return [await convert(collection) for collection in data]
 
     def _indices_for_name(self, name: str) -> list[int]:
         return [index for index, document in enumerate(self._document) if document.get("name") == name]

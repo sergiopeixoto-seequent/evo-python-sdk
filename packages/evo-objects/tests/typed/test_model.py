@@ -77,38 +77,23 @@ class TestSchemaConstants(TestWithConnector):
             class InvalidUnionList(SchemaList[First | Second]):
                 pass
 
-    async def test_schema_list_uploads_items_concurrently_and_preserves_order(self):
+    async def test_schema_list_processes_items_sequentially_and_preserves_order(self):
         class Models(SchemaList[SchemaModel]):
             pass
 
-        started = set()
-        all_started = asyncio.Event()
-        release = asyncio.Event()
-        second_finished = asyncio.Event()
+        completed = []
 
         async def convert(value, context):
-            started.add(value)
-            if len(started) == 2:
-                all_started.set()
-            await release.wait()
-            if value == 0:
-                await second_finished.wait()
-            else:
-                second_finished.set()
+            self.assertEqual(list(range(value)), completed)
+            await asyncio.sleep(0)
+            completed.append(value)
             return {"value": value}
 
         with patch.object(SchemaModel, "_data_to_schema", side_effect=convert):
-            task = asyncio.create_task(Models._data_to_schema([0, 1], self.context))
-            try:
-                await asyncio.wait_for(all_started.wait(), timeout=2)
-                release.set()
-                result = await asyncio.wait_for(task, timeout=2)
-            finally:
-                release.set()
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            result = await Models._data_to_schema([0, 1], self.context)
 
         self.assertEqual([{"value": 0}, {"value": 1}], result)
+        self.assertEqual([0, 1], completed)
 
     async def test_schema_list_accepts_missing_and_empty_data(self):
         for data in (None, [], ()):
@@ -118,6 +103,34 @@ class TestSchemaConstants(TestWithConnector):
     async def test_schema_list_rejects_non_sequences(self):
         with self.assertRaisesRegex(TypeError, "Expected a sequence"):
             await SchemaList._data_to_schema(42, self.context)
+
+    @parameterized.expand([("success", False), ("failure", True)])
+    async def test_default_sub_model_traversal_is_sequential(self, _name, fail):
+        completed = []
+
+        async def first(data, context):
+            await asyncio.sleep(0)
+            if fail:
+                raise ValueError("invalid first")
+            completed.append("first")
+            return {"value": 1}
+
+        async def second(data, context):
+            self.assertEqual(["first"], completed)
+            return {"value": 2}
+
+        with (
+            patch.object(ExtendedLocations._sub_models["attributes"].model_type, "_data_to_schema", side_effect=first),
+            patch.object(CoordinateTable, "_data_to_schema", side_effect=second) as convert_second,
+        ):
+            builder = SchemaBuilder(ExtendedLocations, self.context)
+            if fail:
+                with self.assertRaisesRegex(ValueError, "invalid first"):
+                    await builder.build_from_data(object())
+                convert_second.assert_not_awaited()
+            else:
+                result = await builder.build_from_data(object())
+                self.assertEqual({"attributes": {"value": 1}, "coordinates": {"value": 2}}, result)
 
 
 class CoordinateTable(DataTable):
@@ -221,6 +234,38 @@ class TestDataTableAndAttributesMutation(IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(original, self.document)
+        self.assertEqual({"previous-change"}, self.context.data_modified)
+
+    async def test_attribute_conflict_is_checked_before_table_application(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_table = deepcopy(self.document["coordinates"])
+
+        async def upload(frame, **_kwargs):
+            if frame.columns[0] == "first":
+                started.set()
+                await release.wait()
+            return {"data": "new", "length": 1}
+
+        client = Mock(upload_dataframe=AsyncMock(side_effect=upload))
+        with (
+            patch("evo.objects.typed.attributes.get_data_client", return_value=client),
+            patch("evo.objects.typed._data.get_data_client", return_value=client),
+        ):
+            task = asyncio.create_task(self.model.from_dataframe(self.frame))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                self.document["attributes"][0]["external_edit"] = True
+                release.set()
+                with self.assertRaisesRegex(RuntimeError, "Attributes changed"):
+                    await task
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(original_table, self.document["coordinates"])
+        self.assertEqual("old-first", self.document["attributes"][0]["values"]["data"])
+        self.assertTrue(self.document["attributes"][0]["external_edit"])
         self.assertEqual({"previous-change"}, self.context.data_modified)
 
     async def test_attribute_descriptions_are_prepared_once_before_combined_uploads(self):

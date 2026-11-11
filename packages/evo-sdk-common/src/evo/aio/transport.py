@@ -59,7 +59,7 @@ class AioTransport(ITransport):
             exception.
         :param backoff_method: Configure the retry backoff implementation.
         :param num_pools: Maximum simultaneous HTTP connections across all hosts, shared by requests using this
-            transport. Defaults to 4; 0 disables the connection limit. Independent of table upload concurrency.
+            transport. Defaults to 4; 0 disables the connection limit.
         :param verify_ssl: Verify SSL certificates. This should not be disabled unless you really absolutely have to,
             and never in production environments.
         :param close_grace_period_ms: Grace period (in milliseconds) to wait for connections to close.

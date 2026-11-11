@@ -134,6 +134,7 @@ class DataTableAndAttributes(SchemaModel):
             self.attributes._upload(attr_df, descriptions, attribute_types, attr_fb),
         )
         table_document, attribute_documents = await gather_cancelling(table_upload, attribute_upload)
+        self.attributes._check_unchanged(attribute_documents)
         self._table._apply_uploaded_table(table_df, table_document)
         self.attributes._apply(attribute_documents)
 

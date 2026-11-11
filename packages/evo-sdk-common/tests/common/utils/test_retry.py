@@ -73,13 +73,6 @@ class TestRetry(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.retry = Retry(logger, max_attempts=5, backoff_method=BackoffIncremental(1))
 
-    @mock.patch("asyncio.sleep", spec_set=True)
-    async def test_successful_attempt(self, mock_sleep: mock.MagicMock) -> None:
-        async for _ in self.retry:
-            pass
-
-        mock_sleep.assert_not_called()
-
     async def test_only_exhausted_attempts_log_at_error(self):
         retry_logger = mock.Mock(spec=logging.Logger)
         error = ConnectionError("retry")
@@ -89,6 +82,13 @@ class TestRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [mock.call(logging.WARNING, error), mock.call(logging.ERROR, error)], retry_logger.log.call_args_list
         )
+
+    @mock.patch("asyncio.sleep", spec_set=True)
+    async def test_successful_attempt(self, mock_sleep: mock.MagicMock) -> None:
+        async for _ in self.retry:
+            pass
+
+        mock_sleep.assert_not_called()
 
     @mock.patch("asyncio.sleep", spec_set=True)
     async def test_max_attempts(self, mock_sleep: mock.MagicMock) -> None:

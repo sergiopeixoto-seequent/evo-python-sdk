@@ -11,16 +11,15 @@
 
 import asyncio
 import json
-import logging
 import sys
 import threading
-import weakref
 from contextlib import nullcontext
 from unittest import mock
 from uuid import UUID, uuid4
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 from pandas.testing import assert_frame_equal
 from parameterized import parameterized
 
@@ -29,13 +28,12 @@ from evo.aio import AioTransport
 from evo.common import APIConnector, HTTPHeaderDict, HTTPResponse, IFeedback, RequestMethod
 from evo.common.exceptions import BadRequestException, EvoAPIException, RetryError, TransportError
 from evo.common.io.exceptions import ChunkedIOError, DataExistsError
-from evo.common.io.storage import StorageDestination
 from evo.common.test_tools import TestWithConnector, TestWithStorage
 from evo.common.utils import BackoffLinear, NoFeedback, PartialFeedback, Retry, get_header_metadata
 from evo.objects.endpoints.models import DataUploadResponseBody
 from evo.objects.exceptions import TableFormatError
-from evo.objects.utils import KnownTableFormat, ObjectDataClient, table_formats, upload_concurrency
-from evo.objects.utils._concurrency import _DEFAULT_MAX_CONCURRENCY, gather_cancelling
+from evo.objects.utils import KnownTableFormat, ObjectDataClient, table_formats
+from evo.objects.utils._concurrency import gather_cancelling
 from helpers import NoImport, UnloadModule, get_sample_table_and_bytes
 
 
@@ -234,10 +232,7 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
                     await self.data_client.upload_table(
                         table, retry=Retry(logger=logger, backoff_method=BackoffLinear(0))
                     )
-        if upload_type == "table_transient":
-            self.assertEqual((error, error, error), cm.exception.__cause__.exceptions)
-        else:
-            self.assertIs(error, cm.exception)
+        self.assertIs(error, cm.exception)
         context = (
             "\n".join(getattr(cm.exception, "__notes__", []))
             if sys.version_info >= (3, 11)
@@ -505,226 +500,118 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
 
         upload.assert_not_awaited()
 
-    @parameterized.expand([("plain_serial", False, 1), ("plain", False, 3), ("category", True, 3)])
-    async def test_dataframe_conversion_is_off_loop_and_live_arrow_tables_are_bounded(self, _name, category, limit):
+    @parameterized.expand([("plain", False), ("category", True)])
+    async def test_dataframe_conversion_does_not_block_the_event_loop(self, _name, category):
+        started = asyncio.Event()
+        release = threading.Event()
         loop = asyncio.get_running_loop()
         main_thread = threading.get_ident()
-        reached_limit = asyncio.Event()
-        release = threading.Event()
-        lock = threading.Lock()
-        tables = []
-        conversion_threads = []
-        peak = 0
+        worker_threads = []
         from_pandas = pa.Table.from_pandas
+        frame = pd.DataFrame({"value": pd.Categorical(["sand", "clay"]) if category else [1.0, 2.0]})
 
         def convert(*args, **kwargs):
-            nonlocal peak
-            table = from_pandas(*args, **kwargs)
-            with lock:
-                tables.append(weakref.ref(table))
-                conversion_threads.append(threading.get_ident())
-                live = sum(reference() is not None for reference in tables)
-                peak = max(peak, live)
-                if live == limit:
-                    loop.call_soon_threadsafe(reached_limit.set)
-            return table
+            worker_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(timeout=10):
+                raise TimeoutError("Test did not release conversion")
+            return from_pandas(*args, **kwargs)
 
-        def save_table(table, table_format=None):
-            if not release.wait(timeout=15):
-                raise TimeoutError("The test did not release serialization")
-            return {"data": str(uuid4())}
-
+        method = self.data_client.upload_category_dataframe if category else self.data_client.upload_dataframe
         with (
             mock.patch("evo.objects.utils.data.pa.Table", wraps=pa.Table) as arrow,
-            mock.patch.object(self.data_client, "save_table", new=save_table),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache"),
-            upload_concurrency(limit),
+            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache") as upload,
         ):
             arrow.from_pandas.side_effect = convert
-            upload = self.data_client.upload_category_dataframe if category else self.data_client.upload_dataframe
-            frame = pd.DataFrame({"value": pd.Categorical(["sand", "clay"]) if category else [1.0, 2.0]})
-            task = asyncio.gather(*(upload(frame) for _ in range(12)))
+            task = asyncio.create_task(method(frame))
             try:
-                await asyncio.wait_for(reached_limit.wait(), timeout=10)
-                self.assertEqual(limit, peak)
+                await asyncio.wait_for(started.wait(), timeout=2)
+                self.assertFalse(task.done())
+                upload.assert_not_awaited()
+                self.assertNotEqual(main_thread, worker_threads[0])
                 release.set()
-                await asyncio.wait_for(task, timeout=10)
+                result = await asyncio.wait_for(task, timeout=5)
             finally:
                 release.set()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-
-        self.assertEqual(12, len(tables))
-        self.assertEqual(limit, peak)
-        self.assertTrue(all(thread != main_thread for thread in conversion_threads))
-        self.assertTrue(all(reference() is None for reference in tables))
+        infos = [result["values"], result["table"]] if category else [result]
+        self.assertTrue(all((self.data_client.cache_location / info["data"]).is_file() for info in infos))
 
     @parameterized.expand(
         [
-            ("default", None, False),
-            ("serial", 1, False),
-            ("lower", 3, False),
-            ("higher", 12, False),
-            ("multiple_clients_default", None, True),
-            ("multiple_clients_scope", 3, True),
+            ("plain", "upload_dataframe", "upload_table", False),
+            ("category", "upload_category_dataframe", "upload_category_table", True),
         ]
     )
-    async def test_direct_concurrent_uploads_share_loop_limit(self, _name, configured_limit, multiple_clients) -> None:
-        limit = configured_limit if configured_limit is not None else _DEFAULT_MAX_CONCURRENCY
-        clients = [
-            ObjectDataClient(environment=self.environment, connector=self.connector, cache=self.cache)
-            if multiple_clients
-            else self.data_client
-            for _ in range(24)
-        ]
-        release = asyncio.Event()
-        limit_reached = asyncio.Event()
-        active = 0
-        peak = 0
+    async def test_dataframe_uploads_preserve_public_table_dispatch(self, _name, method, table_method, category):
+        frame = pd.DataFrame({"value": ["sand", "clay"] if category else [1.0, 2.0]})
+        feedback = mock.Mock(spec=IFeedback)
+        result = {"data": "intercepted"}
+        with mock.patch.object(self.data_client, table_method, return_value=result) as upload:
+            actual = await getattr(self.data_client, method)(frame, fb=feedback)
+        self.assertIs(result, actual)
+        upload.assert_awaited_once()
+        self.assertIs(feedback, upload.call_args.kwargs["fb"])
+        self.assertEqual(frame["value"].tolist(), upload.call_args.args[0].column(0).to_pylist())
 
-        async def upload(**_kwargs):
-            nonlocal active, peak
-            active += 1
-            peak = max(peak, active)
-            if active == limit:
-                limit_reached.set()
-            try:
-                await release.wait()
-            finally:
-                active -= 1
+    async def test_category_upload_preserves_public_table_dispatch(self):
+        with mock.patch.object(self.data_client, "upload_table", return_value={"data": "intercepted"}) as upload:
+            result = await self.data_client.upload_category_table(pa.table({"value": ["sand", "clay"]}))
+        self.assertEqual(2, upload.await_count)
+        self.assertEqual(
+            [table_formats.INTEGER_ARRAY_1_INT32, table_formats.LOOKUP_TABLE_INT32],
+            [call.kwargs["table_format"] for call in upload.call_args_list],
+        )
+        self.assertEqual({"values": {"data": "intercepted"}, "table": {"data": "intercepted"}}, result)
 
+    async def test_upload_does_not_multiply_storage_retry_budget(self):
         with (
-            mock.patch.object(ObjectDataClient, "save_table", side_effect=lambda table, _: {"data": table}) as save,
-            mock.patch("evo.objects.utils.data.asyncio.to_thread", side_effect=lambda fn, *args: fn(*args)),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
-            upload_concurrency(configured_limit) if configured_limit is not None else nullcontext(),
+            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}),
+            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache") as upload,
         ):
-            task = asyncio.gather(*(client.upload_table(str(i)) for i, client in enumerate(clients)))
-            try:
-                await asyncio.wait_for(limit_reached.wait(), timeout=2)
-                await asyncio.sleep(0)
-                self.assertEqual(limit, active)
-                release.set()
-                await asyncio.wait_for(task, timeout=2)
-            finally:
-                release.set()
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(limit, peak)
-        self.assertEqual(0, active)
-        self.assertEqual(24, save.call_count)
-
-    async def test_serialization_and_upload_attempts_share_the_same_limit(self):
-        active = 0
-        peak = 0
-
-        async def work(function, *args):
-            nonlocal active, peak
-            active += 1
-            peak = max(peak, active)
-            try:
-                await asyncio.sleep(0)
-                return function(*args)
-            finally:
-                active -= 1
-
-        async def upload(**_kwargs):
-            await work(lambda: None)
-
-        with (
-            mock.patch.object(self.data_client, "save_table", side_effect=lambda table, _: {"data": table}),
-            mock.patch("evo.objects.utils.data.asyncio.to_thread", side_effect=work) as serialize,
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload) as transfer,
-            upload_concurrency(3),
-        ):
-            await asyncio.gather(*(self.data_client.upload_table(str(i)) for i in range(24)))
-        self.assertEqual(3, peak)
-        self.assertEqual(0, active)
-        self.assertEqual(24, serialize.await_count)
-        self.assertEqual(24, transfer.await_count)
-
-    @parameterized.expand([("default", None), ("scope", 1)])
-    def test_client_can_be_reused_across_contended_event_loops(self, _name, limit):
-        async def upload(**_kwargs):
-            await asyncio.sleep(0)
-
-        async def run():
-            return await asyncio.gather(*(self.data_client.upload_table(str(i)) for i in range(16)))
-
-        with (
-            mock.patch.object(self.data_client, "save_table", side_effect=lambda table, _: {"data": table}),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
-            upload_concurrency(limit) if limit is not None else nullcontext(),
-        ):
-            for _ in range(2):
-                result = asyncio.run(asyncio.wait_for(run(), timeout=10))
-                self.assertEqual([str(i) for i in range(16)], [info["data"] for info in result])
-
-    @parameterized.expand([("default", None), ("scope", 3), ("serial", 1)])
-    async def test_concurrent_category_operations_share_limit(self, _name, configured_limit):
-        limit = configured_limit if configured_limit is not None else _DEFAULT_MAX_CONCURRENCY
-        release = asyncio.Event()
-        limit_reached = asyncio.Event()
-        active = 0
-        peak = 0
-
-        async def upload(**_kwargs):
-            nonlocal active, peak
-            active += 1
-            peak = max(peak, active)
-            if active == limit:
-                limit_reached.set()
-            try:
-                await release.wait()
-            finally:
-                active -= 1
-
-        with (
-            mock.patch.object(self.data_client, "save_table", side_effect=lambda *_: {"data": str(uuid4())}),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
-            upload_concurrency(configured_limit) if configured_limit is not None else nullcontext(),
-        ):
-            task = asyncio.gather(
-                *(self.data_client.upload_category_table(pa.table({"value": [str(i)]})) for i in range(10))
-            )
-            try:
-                await asyncio.wait_for(limit_reached.wait(), timeout=2)
-                await asyncio.sleep(0)
-                release.set()
-                await asyncio.wait_for(task, timeout=2)
-            finally:
-                release.set()
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(limit, peak)
-        self.assertEqual(0, active)
+            await self.data_client.upload_table(pa.table({"value": [1.0]}))
+        with self.assertRaises(RetryError):
+            async for attempt in upload.call_args.kwargs["retry"]:
+                attempt.set_exception(ConnectionError("failed"))
 
     @parameterized.expand(
-        [(str(status), EvoAPIException(status, "transient", None, None)) for status in (408, 429, 500, 502, 503, 504)]
-        + [
-            ("timeout", TimeoutError()),
-            ("connection", ConnectionError()),
+        [
+            ("408", 408),
+            ("429", 429),
+            ("500", 500),
+            ("502", 502),
+            ("503", 503),
+            ("504", 504),
+            ("timeout", None),
+            ("connection", False),
         ]
     )
-    async def test_transient_upload_retry_preserves_order_and_cached_tables(self, _name, error):
+    async def test_transient_upload_retry_preserves_order_and_cached_tables(self, _name, status):
+        error = (
+            ConnectionError("offline")
+            if status is False
+            else TimeoutError("timeout")
+            if status is None
+            else EvoAPIException(status, "unavailable", None, None)
+        )
         attempts = {}
         completed = []
         sibling_finished = asyncio.Event()
 
-        async def upload(upload_context, **_kwargs):
-            name = upload_context.name
-            attempts[name] = attempts.get(name, 0) + 1
-            if name == "first" and attempts[name] <= 2:
+        async def upload(context, **_kwargs):
+            attempts[context.name] = attempts.get(context.name, 0) + 1
+            if context.name == "first" and attempts[context.name] <= 2:
                 await sibling_finished.wait()
                 raise error
-            completed.append(name)
+            completed.append(context.name)
             sibling_finished.set()
 
-        retry = Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0))
         with (
             mock.patch.object(self.data_client, "save_table", side_effect=lambda table, _: {"data": table}) as save,
             mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", new=upload),
         ):
+            retry = Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0))
             results = await asyncio.wait_for(
                 gather_cancelling(
                     self.data_client.upload_table("first", retry=retry),
@@ -737,22 +624,36 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
         self.assertEqual({"first": 3, "second": 1}, attempts)
         self.assertEqual(2, save.call_count)
 
-    async def test_retry_covers_actual_upload_url_acquisition(self):
+    @parameterized.expand([("url", None), ("chunk", "comp=block&"), ("commit", "comp=blocklist")])
+    async def test_retry_covers_real_upload_url_chunks_and_commit(self, _name, query):
         response = load_test_data("put_data.json")
+        original_request = self.transport.request
+        failures = 0
+
+        async def request(**kwargs):
+            nonlocal failures
+            if query is not None and query in kwargs["url"] and failures < 2:
+                failures += 1
+                return HTTPResponse(status=503, data=b"", reason="unavailable", headers=HTTPHeaderDict())
+            return await original_request(**kwargs)
+
+        responses = [DataUploadResponseBody(**response[0])]
         with (
             self.transport.set_http_response(status_code=201, content=""),
+            mock.patch.object(self.transport, "request", side_effect=request),
             mock.patch.object(self.data_client, "save_table", wraps=self.data_client.save_table) as save,
             mock.patch(
                 "evo.objects.io.DataApi.put_data_in_workspace",
-                side_effect=[TimeoutError(), [DataUploadResponseBody(**response[0])]],
+                side_effect=[EvoAPIException(503, "unavailable", None, None), responses] if query is None else None,
+                return_value=responses,
             ) as request_url,
+            mock.patch("evo.common.utils.retry.asyncio.sleep") as sleep,
         ):
-            result = await self.data_client.upload_table(
-                pa.table({"value": [1.0]}),
-                retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0)),
-            )
+            result = await self.data_client.upload_table(pa.table({"value": [1.0]}))
+        self.assertEqual(2 if query is None else 3, request_url.await_count)
+        self.assertEqual(0 if query is None else 2, failures)
+        self.assertEqual([mock.call(4)] if query is None else [mock.call(4), mock.call(8)], sleep.call_args_list)
         self.assertTrue((self.data_client.cache_location / result["data"]).is_file())
-        self.assertEqual(2, request_url.await_count)
         save.assert_called_once()
 
     @parameterized.expand([("url", False), ("storage", True)])
@@ -796,9 +697,20 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
     async def test_public_upload_methods_honor_retry_policy(self, method, category):
         frame = pd.DataFrame({"value": ["sand", "clay"] if category else [1.0, 2.0]})
         data = frame if "dataframe" in method else pa.table({"value": frame["value"].tolist()})
+        started = 0
+        all_started = asyncio.Event()
+
+        async def fail(**_kwargs):
+            nonlocal started
+            started += 1
+            if started == (2 if category else 1):
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+            raise EvoAPIException(503, "unavailable", None, None)
+
         with mock.patch(
             "evo.objects.io.ObjectDataUpload.upload_from_cache",
-            side_effect=EvoAPIException(503, "unavailable", None, None),
+            side_effect=fail,
         ) as upload:
             with self.assertRaises(EvoAPIException) as caught:
                 await getattr(self.data_client, method)(
@@ -808,145 +720,126 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
         self.assertEqual(1, len(caught.exception.__cause__.exceptions))
         self.assertEqual(2 if category else 1, upload.await_count)
 
-    @parameterized.expand([("chunk", "comp=block&"), ("commit", "comp=blocklist")])
-    async def test_retry_covers_real_storage_retry_exhaustion(self, _name, query):
-        response = load_test_data("put_data.json")
-        original_request = self.transport.request
-        failed = False
-        storage_errors = []
-        upload_file = StorageDestination.upload_file
-
-        async def upload_with_single_attempt(**kwargs):
-            kwargs["retry"] = Retry(logger=mock.Mock(), max_attempts=1, backoff_method=BackoffLinear(0))
-            try:
-                await upload_file(**kwargs)
-            except RetryError as error:
-                storage_errors.append(error)
-                raise
-
-        async def request(**kwargs):
-            nonlocal failed
-            if query in kwargs["url"] and not failed:
-                failed = True
-                return HTTPResponse(status=503, data=b"", reason="unavailable", headers=HTTPHeaderDict())
-            return await original_request(**kwargs)
-
-        with (
-            self.transport.set_http_response(status_code=201, content=""),
-            mock.patch.object(self.transport, "request", side_effect=request),
-            mock.patch("evo.common.io.upload.StorageDestination.upload_file", side_effect=upload_with_single_attempt),
-            mock.patch.object(self.data_client, "save_table", wraps=self.data_client.save_table) as save,
-            mock.patch(
-                "evo.objects.io.DataApi.put_data_in_workspace",
-                return_value=[DataUploadResponseBody(**response[0])],
-            ) as request_url,
-        ):
-            result = await self.data_client.upload_table(
-                pa.table({"value": [1.0]}),
-                retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0)),
-            )
-        self.assertTrue(failed)
-        self.assertEqual(1, len(storage_errors))
-        self.assertIsInstance(storage_errors[0].exceptions[0], ChunkedIOError)
-        self.assertIsInstance(storage_errors[0].exceptions[0].__cause__, EvoAPIException)
-        self.assertEqual(503, storage_errors[0].exceptions[0].__cause__.status)
-        self.assertTrue((self.data_client.cache_location / result["data"]).is_file())
-        self.assertEqual(2, request_url.await_count)
-        save.assert_called_once()
-
-    @parameterized.expand(
-        [
-            ("url", EvoAPIException),
-            ("connection", ConnectionError),
-        ]
-    )
-    async def test_retry_exhaustion_is_bounded_and_preserves_errors(self, _name, error_type):
-        errors = []
-        for i in range(3):
-            cause = EvoAPIException(503, f"unavailable-{i}", None, None)
-            error = cause if error_type is EvoAPIException else error_type(f"unavailable-{i}")
-            errors.append(error)
+    async def test_retry_exhaustion_is_bounded_and_preserves_errors(self):
+        errors = [EvoAPIException(503, f"unavailable-{i}", None, None) for i in range(3)]
         with (
             mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}) as save,
             mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=errors) as upload,
+            mock.patch("evo.common.utils.retry.asyncio.sleep") as sleep,
         ):
-            with self.assertRaises(error_type) as caught:
-                await self.data_client.upload_table(
-                    mock.Mock(), retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0))
-                )
+            with self.assertRaises(EvoAPIException) as caught:
+                await self.data_client.upload_table(pa.table({"value": [1.0]}))
         self.assertIs(errors[-1], caught.exception)
         self.assertEqual(tuple(errors), caught.exception.__cause__.exceptions)
+        self.assertEqual([mock.call(4), mock.call(8)], sleep.call_args_list)
         self.assertEqual(3, upload.await_count)
         save.assert_called_once()
 
-    async def test_recovered_upload_logs_warning_not_error(self):
-        with (
-            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}),
-            mock.patch(
-                "evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=[ConnectionError("retry"), None]
-            ),
-            self.assertLogs("evo.object.data", level=logging.WARNING) as logs,
-        ):
-            await self.data_client.upload_table(
-                mock.Mock(), retry=Retry(logger=logging.getLogger("evo.object.data"), backoff_method=BackoffLinear(0))
-            )
-        self.assertEqual([logging.WARNING], [record.levelno for record in logs.records])
-
-    async def test_other_uploads_proceed_during_backoff(self):
+    async def test_cancellation_during_backoff_stops_retries_without_blocking_other_uploads(self):
         backing_off = asyncio.Event()
         release = asyncio.Event()
-        attempts = {}
-        sleep = asyncio.sleep
+        calls = []
 
-        async def backoff(delay):
-            if delay == 1:
-                backing_off.set()
-                await release.wait()
-            else:
-                await sleep(delay)
+        async def backoff(_delay):
+            backing_off.set()
+            await release.wait()
 
-        async def upload(upload, **_kwargs):
-            attempts[upload.name] = attempts.get(upload.name, 0) + 1
-            if upload.name == "first" and attempts[upload.name] == 1:
-                raise ConnectionError("retry")
+        async def upload(context, **_kwargs):
+            calls.append(context.name)
+            if context.name == "first":
+                raise EvoAPIException(503, "unavailable", None, None)
 
         with (
             mock.patch.object(self.data_client, "save_table", side_effect=lambda table, _: {"data": table}),
             mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", new=upload),
             mock.patch("evo.common.utils.retry.asyncio.sleep", side_effect=backoff),
-            upload_concurrency(1),
         ):
-            task = asyncio.create_task(
-                self.data_client.upload_table("first", retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(1)))
-            )
+            task = asyncio.create_task(self.data_client.upload_table("first"))
             try:
                 await asyncio.wait_for(backing_off.wait(), timeout=2)
-                self.assertEqual({"data": "second"}, await asyncio.wait_for(self.data_client.upload_table("second"), 2))
-                self.assertFalse(task.done())
-                release.set()
-                await asyncio.wait_for(task, timeout=2)
+                self.assertEqual({"data": "second"}, await self.data_client.upload_table("second"))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
             finally:
                 release.set()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual({"first": 2, "second": 1}, attempts)
+        self.assertEqual(["first", "second"], calls)
 
-    @parameterized.expand([("cancelled",), ("failed",)])
-    async def test_identical_uploads_do_not_share_cancellation_or_failures(self, outcome):
+    async def test_retry_progress_is_monotonic_and_existing_data_is_success(self):
+        feedback = mock.Mock(spec=IFeedback)
+        calls = 0
+
+        async def upload(**kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["fb"].progress(0.8 if calls == 1 else 0.2)
+            if calls == 1:
+                raise ConnectionError("retry")
+            raise DataExistsError()
+
+        with (
+            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}) as save,
+            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
+        ):
+            result = await self.data_client.upload_table(
+                pa.table({"value": [1.0]}),
+                fb=feedback,
+                retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0)),
+            )
+        progress = [call.args[0] for call in feedback.progress.call_args_list]
+        self.assertEqual(sorted(progress), progress)
+        self.assertEqual(1, progress[-1])
+        self.assertEqual({"data": "saved"}, result)
+        self.assertEqual(2, calls)
+        save.assert_called_once()
+
+    def test_client_can_be_reused_across_event_loops(self):
+        async def upload(**_kwargs):
+            await asyncio.sleep(0)
+
+        async def run():
+            return await asyncio.gather(*(self.data_client.upload_table(str(i)) for i in range(16)))
+
+        with (
+            mock.patch.object(self.data_client, "save_table", side_effect=lambda table, _: {"data": table}),
+            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
+        ):
+            for _ in range(2):
+                result = asyncio.run(asyncio.wait_for(run(), timeout=10))
+                self.assertEqual([str(i) for i in range(16)], [info["data"] for info in result])
+
+    @parameterized.expand(
+        [
+            ("same_client_cancelled", "cancelled", False),
+            ("same_client_failed", "failed", False),
+            ("separate_clients_cancelled", "cancelled", True),
+            ("separate_clients_failed", "failed", True),
+        ]
+    )
+    async def test_identical_uploads_do_not_share_cancellation_or_failures(self, _name, outcome, separate_clients):
         started = [asyncio.Event(), asyncio.Event()]
         release = [asyncio.Event(), asyncio.Event()]
         calls = 0
-        other_client = ObjectDataClient(environment=self.environment, connector=self.connector, cache=self.cache)
+        other_client = (
+            ObjectDataClient(environment=self.environment, connector=self.connector, cache=self.cache)
+            if separate_clients
+            else self.data_client
+        )
         table = pa.table({"value": [1.0]})
+        table_info = self.data_client.save_table(table)
 
         async def upload(**_kwargs):
             nonlocal calls
             index = calls
             calls += 1
-            started[index].set()
-            await release[index].wait()
-            if index == 0:
-                raise RuntimeError("upload failed")
+            with (self.data_client.cache_location / table_info["data"]).open("rb") as cached:
+                started[index].set()
+                await release[index].wait()
+                if index == 0:
+                    raise RuntimeError("upload failed")
+                self.assertEqual([1.0], pq.read_table(cached).column(0).to_pylist())
 
         with mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload):
             first = asyncio.create_task(self.data_client.upload_table(table))
@@ -967,7 +860,7 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
                 self.assertFalse(second.done())
                 release[1].set()
                 result = await asyncio.wait_for(second, timeout=10)
-                self.assertEqual(self.data_client.save_table(table), result)
+                self.assertEqual(table_info, result)
             finally:
                 for event in release:
                     event.set()
@@ -975,71 +868,6 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         self.assertEqual(2, calls)
-
-    async def test_identical_uploads_use_independent_retry_policies(self):
-        async def upload(**_kwargs):
-            await asyncio.sleep(0)
-            raise ConnectionError("retry")
-
-        with (
-            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload) as transfer,
-        ):
-            results = await asyncio.gather(
-                *(
-                    self.data_client.upload_table(
-                        mock.Mock(),
-                        retry=Retry(logger=mock.Mock(), max_attempts=limit, backoff_method=BackoffLinear(0)),
-                    )
-                    for limit in (1, 2)
-                ),
-                return_exceptions=True,
-            )
-        self.assertTrue(all(isinstance(result, ConnectionError) for result in results))
-        self.assertEqual([1, 2], [len(result.__cause__.exceptions) for result in results])
-        self.assertEqual(3, transfer.await_count)
-
-    async def test_concurrent_uploads_share_identical_cached_data(self):
-        async def upload(**_kwargs):
-            await asyncio.sleep(0)
-
-        with (
-            mock.patch.object(self.data_client, "save_table", return_value={"data": "same"}),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload) as transfer,
-        ):
-            results = await asyncio.gather(
-                self.data_client.upload_table(mock.Mock()),
-                self.data_client.upload_table(mock.Mock()),
-            )
-
-        self.assertEqual([{"data": "same"}, {"data": "same"}], results)
-        transfer.assert_awaited_once()
-
-    async def test_upload_progress_does_not_decrease_after_retry(self):
-        feedback = mock.Mock(spec=IFeedback)
-        calls = 0
-
-        async def upload(**kwargs):
-            nonlocal calls
-            calls += 1
-            kwargs["fb"].progress(0.8 if calls == 1 else 0.2)
-            if calls == 1:
-                raise ConnectionError("retry")
-            kwargs["fb"].progress(1)
-
-        with (
-            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}),
-            mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=upload),
-        ):
-            await self.data_client.upload_table(
-                mock.Mock(),
-                fb=feedback,
-                retry=Retry(logger=mock.Mock(), max_attempts=2, backoff_method=BackoffLinear(0)),
-            )
-
-        progress = [call.args[0] for call in feedback.progress.call_args_list]
-        self.assertEqual(sorted(progress), progress)
-        self.assertEqual(1, progress[-1])
 
     @parameterized.expand(
         [
@@ -1059,7 +887,7 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
             ("cancelled", asyncio.CancelledError()),
         ]
     )
-    async def test_permanent_errors_and_cancellation_are_not_retried(self, _name, error):
+    async def test_storage_errors_and_cancellation_propagate_unchanged(self, _name, error):
         with (
             mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}),
             mock.patch("evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=error) as upload,
@@ -1068,22 +896,6 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
                 await self.data_client.upload_table(mock.Mock())
         self.assertIs(error, caught.exception)
         upload.assert_awaited_once()
-
-    async def test_already_existing_data_after_retry_is_success(self):
-        feedback = mock.Mock(spec=IFeedback)
-        with (
-            mock.patch.object(self.data_client, "save_table", return_value={"data": "saved"}) as save,
-            mock.patch(
-                "evo.objects.io.ObjectDataUpload.upload_from_cache", side_effect=[TimeoutError(), DataExistsError()]
-            ) as upload,
-        ):
-            result = await self.data_client.upload_table(
-                mock.Mock(), fb=feedback, retry=Retry(logger=mock.Mock(), backoff_method=BackoffLinear(0))
-            )
-        self.assertEqual({"data": "saved"}, result)
-        self.assertEqual(2, upload.await_count)
-        save.assert_called_once()
-        feedback.progress.assert_called_with(1)
 
     async def test_category_values_and_lookup_upload_concurrently(self) -> None:
         started = []
@@ -1331,7 +1143,7 @@ class TestObjectDataClient(TestWithConnector, TestWithStorage):
         ):
             await self.data_client.upload_dataframe(dataframe)
 
-        (table,), _ = save.call_args
+        table = save.call_args.args[0]
         self.assertTrue(pa.types.is_string(table.schema.field("col").type))
 
     async def test_download_table(self) -> None:
